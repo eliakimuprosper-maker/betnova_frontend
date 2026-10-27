@@ -1,0 +1,729 @@
+// stores/authStore.js
+import { ref, computed } from 'vue'
+import { defineStore } from 'pinia'
+import * as authService from '../services/auth.service'
+import api from '../services/api'
+
+export const useAuthStore = defineStore('auth', () => {
+  // State - Load from localStorage on initialization
+  const user = ref(JSON.parse(localStorage.getItem('user') || 'null'))
+  const userBalance = ref(Number(localStorage.getItem('userBalance') || 0))
+  const transactions = ref(JSON.parse(localStorage.getItem('transactions') || '[]'))
+  const accessToken = ref(localStorage.getItem('access_token') || null)
+  const refreshToken = ref(localStorage.getItem('refresh_token') || null)
+  const isLoading = ref(false)
+  const error = ref(null)
+
+  // Getters
+  const isAuthenticated = computed(() => {
+    return !!accessToken.value && !!user.value
+  })
+
+  const isLoggedIn = computed(() => isAuthenticated.value)
+
+  // Helper function to persist data to localStorage
+  const persistToStorage = () => {
+    if (user.value) {
+      localStorage.setItem('user', JSON.stringify(user.value))
+    } else {
+      localStorage.removeItem('user')
+    }
+    
+    if (userBalance.value !== undefined && userBalance.value !== null) {
+      localStorage.setItem('userBalance', userBalance.value.toString())
+    } else {
+      localStorage.removeItem('userBalance')
+    }
+    
+    if (transactions.value && transactions.value.length > 0) {
+      localStorage.setItem('transactions', JSON.stringify(transactions.value))
+    } else {
+      localStorage.removeItem('transactions')
+    }
+  }
+
+  // Actions
+  const register = async (phoneNumber, password) => {
+    isLoading.value = true
+    error.value = null
+    
+    try {
+      const response = await authService.register({
+        phone_number: phoneNumber,
+        password: password
+      })
+      
+      if (response.data) {
+        return { success: true, data: response.data }
+      }
+      
+      return { success: false, message: 'Registration failed' }
+    } catch (err) {
+      console.error('Registration error:', err)
+      error.value = err.message || 'Registration failed'
+      return { success: false, message: error.value }
+    } finally {
+      isLoading.value = false
+    }
+  }
+
+  const login = async (credentials, keepLoggedIn = true) => {
+    isLoading.value = true
+    error.value = null
+    
+    try {
+      const response = await authService.login({
+        phone_number: credentials.phoneNumber,
+        password: credentials.password
+      })
+      
+      if (response.data) {
+        // Save tokens
+        accessToken.value = response.data.accessToken
+        refreshToken.value = response.data.refreshToken
+        
+        localStorage.setItem('access_token', response.data.accessToken)
+        localStorage.setItem('refresh_token', response.data.refreshToken)
+        
+        // Set user info
+        user.value = {
+          id: response.data.id,
+          phone_number: response.data.phone_number,
+          ...(response.data.user || {})
+        }
+        
+        // Set default auth header for future requests
+        api.defaults.headers.common['Authorization'] = `Bearer ${response.data.accessToken}`
+        
+        // Fetch user balance after login
+        await fetchUserBalance()
+        
+        // Fetch user profile
+        await fetchUserProfile()
+        
+        // Persist all data to localStorage
+        persistToStorage()
+        
+        return { success: true, data: user.value }
+      }
+      
+      return { success: false, message: 'Login failed' }
+    } catch (err) {
+      console.error('Login error:', err)
+      error.value = err.message || 'Invalid credentials'
+      return { success: false, message: error.value }
+    } finally {
+      isLoading.value = false
+    }
+  }
+
+  const logout = async () => {
+    user.value = null
+    userBalance.value = 0
+    transactions.value = []
+    accessToken.value = null
+    refreshToken.value = null
+    
+    // Clear all localStorage items
+    localStorage.removeItem('access_token')
+    localStorage.removeItem('refresh_token')
+    localStorage.removeItem('user')
+    localStorage.removeItem('userBalance')
+    localStorage.removeItem('transactions')
+    
+    // Remove auth header
+    delete api.defaults.headers.common['Authorization']
+  }
+
+  const refreshAccessToken = async () => {
+    if (!refreshToken.value) {
+      await logout()
+      return false
+    }
+    
+    try {
+      const response = await authService.refreshToken(refreshToken.value)
+      
+      if (response.data) {
+        accessToken.value = response.data.accessToken
+        localStorage.setItem('access_token', response.data.accessToken)
+        api.defaults.headers.common['Authorization'] = `Bearer ${response.data.accessToken}`
+        return true
+      }
+
+      return false
+    } catch (err) {
+      console.error('Token refresh error:', err)
+      await logout()
+      return false
+    }
+  }
+
+  const fetchUserBalance = async () => {
+    if (!accessToken.value) {
+      console.log('No access token, cannot fetch balance')
+      return false
+    }
+    
+    try {
+      const response = await api.get('/auth/balance')
+      if (response.data?.data?.balance !== undefined) {
+        userBalance.value = response.data.data.balance
+        persistToStorage() // Persist after balance update
+        return true
+      } else if (response.data?.balance !== undefined) {
+        userBalance.value = response.data.balance
+        persistToStorage() // Persist after balance update
+        return true
+      }
+      return false
+    } catch (err) {
+      console.error('Failed to fetch balance:', err)
+      // Don't clear balance on error, keep cached value
+      return false
+    }
+  }
+
+  const fetchUserProfile = async () => {
+    if (!accessToken.value) {
+      console.log('No access token, cannot fetch profile')
+      return false
+    }
+    
+    try {
+      const response = await authService.getProfile()
+      if (response.data && response.data.user) {
+        user.value = { ...user.value, ...response.data.user }
+        persistToStorage() // Persist after profile update
+        return true
+      } else if (response.data) {
+        user.value = { ...user.value, ...response.data }
+        persistToStorage() // Persist after profile update
+        return true
+      }
+      return false
+    } catch (err) {
+      console.error('Failed to fetch profile:', err)
+      return false
+    }
+  }
+
+  // const fetchTransactions = async (limit = 10, offset = 0) => {
+  //   if (!accessToken.value) {
+  //     console.log('No access token, cannot fetch transactions')
+  //     return false
+  //   }
+    
+  //   try {
+  //     const response = await api.get('/auth/transactions', {
+  //       params: { limit, offset }
+  //     })
+      
+  //     if (response.data?.data) {
+  //       transactions.value = response.data.data
+  //       persistToStorage() 
+  //       return true
+  //     } else if (response.data?.transactions) {
+  //       transactions.value = response.data.transactions
+  //       persistToStorage() 
+  //       return true
+  //     }
+  //     return false
+  //   } catch (err) {
+  //     console.error('Failed to fetch transactions:', err)
+  //     return false
+  //   }
+  // }
+
+  const updateBalance = (newBalance) => {
+    userBalance.value = newBalance
+    persistToStorage() // Persist balance update
+  }
+
+  const checkAuth = async () => {
+    if (accessToken.value) {
+      api.defaults.headers.common['Authorization'] = `Bearer ${accessToken.value}`
+      
+      try {
+        // Verify token by fetching profile
+        const response = await authService.getProfile()
+        if (response.data && response.data.user) {
+          user.value = response.data.user
+          persistToStorage() // Persist after auth check
+          
+          // Fetch fresh balance in background
+          await fetchUserBalance()
+          return true
+        } else if (response.data) {
+          user.value = response.data
+          persistToStorage() // Persist after auth check
+          
+          // Fetch fresh balance in background
+          await fetchUserBalance()
+          return true
+        }
+      } catch (err) {
+        console.error('Auth check failed:', err)
+        // Try to refresh token
+        const refreshed = await refreshAccessToken()
+        if (!refreshed) {
+          await logout()
+        } else {
+          // If token refreshed, fetch fresh data
+          await fetchUserBalance()
+          await fetchUserProfile()
+        }
+        return refreshed
+      }
+    }
+    return false
+  }
+  // ADD THESE ACTIONS TO authStore.js (inside the store)
+
+// Forgot password - Step 1 (request reset)
+const forgotPassword = async (phoneNumber) => {
+  isLoading.value = true
+  error.value = null
+  
+  try {
+    const response = await authService.forgotPassword(phoneNumber)
+    
+    if (response.success !== false) {
+      return { 
+        success: true, 
+        message: response.message || 'Password reset initiated',
+        userId: response.userId 
+      }
+    }
+    
+    return { success: false, message: response.message || 'Request failed' }
+  } catch (err) {
+    console.error('Forgot password error:', err)
+    error.value = err.message || 'Failed to process request'
+    return { success: false, message: error.value }
+  } finally {
+    isLoading.value = false
+  }
+}
+
+// Reset password - Step 2 (using userId)
+const resetPassword = async (userId, newPassword, confirmPassword) => {
+  isLoading.value = true
+  error.value = null
+  
+  try {
+    const response = await authService.resetPassword(userId, newPassword, confirmPassword)
+    
+    if (response.success !== false) {
+      return { 
+        success: true, 
+        message: response.message || 'Password reset successful' 
+      }
+    }
+    
+    return { success: false, message: response.message || 'Reset failed' }
+  } catch (err) {
+    console.error('Reset password error:', err)
+    error.value = err.message || 'Failed to reset password'
+    return { success: false, message: error.value }
+  } finally {
+    isLoading.value = false
+  }
+}
+
+// Change password by phone (one step alternative)
+const changePasswordByPhone = async (phoneNumber, newPassword, confirmPassword) => {
+  isLoading.value = true
+  error.value = null
+  
+  try {
+    const response = await authService.changePasswordByPhone(phoneNumber, newPassword, confirmPassword)
+    
+    if (response.success !== false) {
+      return { 
+        success: true, 
+        message: response.message || 'Password changed successfully' 
+      }
+    }
+    
+    return { success: false, message: response.message || 'Change failed' }
+  } catch (err) {
+    console.error('Change password error:', err)
+    error.value = err.message || 'Failed to change password'
+    return { success: false, message: error.value }
+  } finally {
+    isLoading.value = false
+  }
+}
+
+
+// ============ ADMIN ACTIONS ============
+
+/**
+ * ADMIN: Get all users
+ * @param {number} limit 
+ * @param {number} offset 
+ */
+const adminGetAllUsers = async (limit = 100, offset = 0) => {
+  isLoading.value = true
+  error.value = null
+  
+  try {
+    const response = await authService.adminGetAllUsers(limit, offset)
+    
+    if (response.success) {
+      return { 
+        success: true, 
+        data: response.data,
+        users: response.data.users || [],
+        total: response.data.total || 0
+      }
+    }
+    
+    return { success: false, message: response.message || 'Failed to fetch users' }
+  } catch (err) {
+    console.error('Admin get all users error:', err)
+    error.value = err.message || 'Failed to fetch users'
+    return { success: false, message: error.value }
+  } finally {
+    isLoading.value = false
+  }
+}
+
+/**
+ * ADMIN: Get user by phone number
+ * @param {string} phoneNumber 
+ */
+const adminGetUserByPhone = async (phoneNumber) => {
+  isLoading.value = true
+  error.value = null
+  
+  try {
+    const response = await authService.adminGetUserByPhone(phoneNumber)
+    
+    if (response.success) {
+      return { 
+        success: true, 
+        data: response.data,
+        user: response.data
+      }
+    }
+    
+    return { success: false, message: response.message || 'User not found' }
+  } catch (err) {
+    console.error('Admin get user error:', err)
+    error.value = err.message || 'Failed to fetch user'
+    return { success: false, message: error.value }
+  } finally {
+    isLoading.value = false
+  }
+}
+
+/**
+ * ADMIN: Set exact balance for a user
+ * @param {string} phoneNumber 
+ * @param {number} balance 
+ */
+const adminSetBalance = async (phoneNumber, balance) => {
+  isLoading.value = true
+  error.value = null
+  
+  try {
+    const response = await authService.adminSetBalance(phoneNumber, balance)
+    
+    if (response.success) {
+      return { 
+        success: true, 
+        message: response.message || 'Balance set successfully',
+        data: response.data
+      }
+    }
+    
+    return { success: false, message: response.message || 'Failed to set balance' }
+  } catch (err) {
+    console.error('Admin set balance error:', err)
+    error.value = err.message || 'Failed to set balance'
+    return { success: false, message: error.value }
+  } finally {
+    isLoading.value = false
+  }
+}
+
+/**
+ * ADMIN: Add balance to a user
+ * @param {string} phoneNumber 
+ * @param {number} amount 
+ */
+const adminAddBalance = async (phoneNumber, amount) => {
+  isLoading.value = true
+  error.value = null
+  
+  try {
+    const response = await authService.adminAddBalance(phoneNumber, amount)
+    
+    if (response.success) {
+      return { 
+        success: true, 
+        message: response.message || 'Balance added successfully',
+        data: response.data
+      }
+    }
+    
+    return { success: false, message: response.message || 'Failed to add balance' }
+  } catch (err) {
+    console.error('Admin add balance error:', err)
+    error.value = err.message || 'Failed to add balance'
+    return { success: false, message: error.value }
+  } finally {
+    isLoading.value = false
+  }
+}
+
+/**
+ * ADMIN: Deduct balance from a user
+ * @param {string} phoneNumber 
+ * @param {number} amount 
+ */
+const adminDeductBalance = async (phoneNumber, amount) => {
+  isLoading.value = true
+  error.value = null
+  
+  try {
+    const response = await authService.adminDeductBalance(phoneNumber, amount)
+    
+    if (response.success) {
+      return { 
+        success: true, 
+        message: response.message || 'Balance deducted successfully',
+        data: response.data
+      }
+    }
+    
+    return { success: false, message: response.message || 'Failed to deduct balance' }
+  } catch (err) {
+    console.error('Admin deduct balance error:', err)
+    error.value = err.message || 'Failed to deduct balance'
+    return { success: false, message: error.value }
+  } finally {
+    isLoading.value = false
+  }
+}
+
+/**
+ * ADMIN: Delete user by phone number
+ * @param {string} phoneNumber 
+ */
+const adminDeleteUser = async (phoneNumber) => {
+  isLoading.value = true
+  error.value = null
+  
+  try {
+    const response = await authService.adminDeleteUser(phoneNumber)
+    
+    if (response.success) {
+      return { 
+        success: true, 
+        message: response.message || 'User deleted successfully',
+        data: response.data
+      }
+    }
+    
+    return { success: false, message: response.message || 'Failed to delete user' }
+  } catch (err) {
+    console.error('Admin delete user error:', err)
+    error.value = err.message || 'Failed to delete user'
+    return { success: false, message: error.value }
+  } finally {
+    isLoading.value = false
+  }
+}
+
+
+
+// ============ WINNING NOTIFICATIONS ACTIONS ============
+
+/**
+ * Fetch unchecked winning bets for current user
+ * This is called after login to check for any wins that haven't been shown
+ */
+const fetchUncheckedWins = async () => {
+  if (!accessToken.value) {
+    console.log('No access token, cannot fetch unchecked wins')
+    return { success: false, data: { hasUnreadWins: false, wins: [] } }
+  }
+  
+  isLoading.value = true
+  error.value = null
+  
+  try {
+    const response = await api.get('/bets/unchecked-wins')
+    
+    if (response.data?.success) {
+      const { hasUnreadWins, wins } = response.data.data
+      
+      // Store wins in localStorage for persistence across refreshes
+      if (wins && wins.length > 0) {
+        localStorage.setItem('unchecked_wins', JSON.stringify(wins))
+        localStorage.setItem('has_unread_wins', hasUnreadWins)
+      } else {
+        localStorage.removeItem('unchecked_wins')
+        localStorage.removeItem('has_unread_wins')
+      }
+      
+      return { 
+        success: true, 
+        data: { hasUnreadWins, wins }
+      }
+    }
+    
+    return { success: false, data: { hasUnreadWins: false, wins: [] } }
+  } catch (err) {
+    console.error('Failed to fetch unchecked wins:', err)
+    error.value = err.message || 'Failed to fetch winning notifications'
+    return { success: false, data: { hasUnreadWins: false, wins: [] } }
+  } finally {
+    isLoading.value = false
+  }
+}
+
+/**
+ * Mark a specific winning bet as notified
+ * @param {string} betId - The ID of the winning bet
+ */
+const markWinningAsNotified = async (betId) => {
+  if (!accessToken.value || !betId) {
+    return { success: false, message: 'Missing required data' }
+  }
+  
+  try {
+    const response = await api.patch(`/bets/${betId}/mark-winning-notified`)
+    
+    if (response.data?.success) {
+      // Update localStorage to remove this win from unchecked list
+      const storedWins = JSON.parse(localStorage.getItem('unchecked_wins') || '[]')
+      const updatedWins = storedWins.filter(win => win.id !== betId)
+      
+      if (updatedWins.length > 0) {
+        localStorage.setItem('unchecked_wins', JSON.stringify(updatedWins))
+        localStorage.setItem('has_unread_wins', 'true')
+      } else {
+        localStorage.removeItem('unchecked_wins')
+        localStorage.removeItem('has_unread_wins')
+      }
+      
+      return { success: true, message: 'Bet marked as notified' }
+    }
+    
+    return { success: false, message: response.data?.message || 'Failed to mark as notified' }
+  } catch (err) {
+    console.error('Failed to mark winning as notified:', err)
+    return { success: false, message: err.message || 'Failed to update notification status' }
+  }
+}
+
+/**
+ * Get cached unchecked wins from localStorage (for quick access)
+ * This is useful before making API call to show modal immediately
+ */
+const getCachedUncheckedWins = () => {
+  const wins = JSON.parse(localStorage.getItem('unchecked_wins') || '[]')
+  const hasWins = localStorage.getItem('has_unread_wins') === 'true'
+  
+  return {
+    hasUnreadWins: hasWins && wins.length > 0,
+    wins
+  }
+}
+
+/**
+ * Clear all unchecked wins from cache (used after user has seen all)
+ */
+const clearUncheckedWinsCache = () => {
+  localStorage.removeItem('unchecked_wins')
+  localStorage.removeItem('has_unread_wins')
+}
+
+/**
+ * Check for new wins after bet settlement (optional real-time)
+ * Call this after a bet is settled
+ * @param {string} betId - The ID of the recently settled bet
+ */
+const checkForNewWinAfterSettlement = async (betId) => {
+  if (!accessToken.value || !betId) {
+    return { success: false }
+  }
+  
+  try {
+    // First check the specific bet
+    const response = await api.get(`/bets/${betId}`)
+    
+    if (response.data?.success) {
+      const bet = response.data.data
+      
+      // If bet is WON and not yet notified, add to unchecked wins
+      if (bet.result === 'WON' && !bet.isWinningNotified) {
+        // Refresh the full unchecked wins list
+        await fetchUncheckedWins()
+        
+        return { 
+          success: true, 
+          isWinner: true,
+          bet: bet
+        }
+      }
+    }
+    
+    return { success: true, isWinner: false }
+  } catch (err) {
+    console.error('Failed to check bet after settlement:', err)
+    return { success: false, isWinner: false }
+  }
+}
+  // Initialize auth header if token exists
+  if (accessToken.value) {
+    api.defaults.headers.common['Authorization'] = `Bearer ${accessToken.value}`
+  }
+
+  return {
+    // State
+    user,
+    userBalance,
+    transactions,
+    accessToken,
+    refreshToken,
+    isLoading,
+    error,
+    
+    // Getters
+    isAuthenticated,
+    isLoggedIn,
+    // Actions
+    register,
+    login,
+    logout,
+    refreshAccessToken,
+    checkAuth,
+    fetchUserBalance,
+    fetchUserProfile,
+    
+    updateBalance,
+
+  forgotPassword,       
+  resetPassword,        
+  changePasswordByPhone  ,
+  // Admin Actions
+  adminGetAllUsers,
+  adminGetUserByPhone,
+  adminSetBalance,
+  adminAddBalance,
+  adminDeductBalance,
+  adminDeleteUser,
+
+   // WINNING NOTIFICATIONS ACTIONS (NEW)
+   fetchUncheckedWins,
+   markWinningAsNotified,
+   getCachedUncheckedWins,
+   clearUncheckedWinsCache,
+   checkForNewWinAfterSettlement
+  }
+})
